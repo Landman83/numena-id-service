@@ -4,38 +4,12 @@ pragma solidity 0.8.17;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@onchain-id/solidity/contracts/interface/IIdentity.sol";
 import "@onchain-id/solidity/contracts/interface/IClaimIssuer.sol";
+import "./interfaces/IIdentityRegistry.sol";
 import "@onchain-id/solidity/contracts/proxy/ImplementationAuthority.sol";
 import "@onchain-id/solidity/contracts/Identity.sol";
+import "./interfaces/IGateway.sol";
 
-/// @title Identity Factory for creating new OnchainID identities
-/// @notice Handles the deployment of new identity contracts
-contract IdentityFactory is Ownable {
-    address public immutable implementationAuthority;
-    
-    event IdentityCreated(address indexed identity, address indexed owner);
-    
-    constructor(address _implementationAuthority) {
-        require(_implementationAuthority != address(0), "Invalid implementation authority");
-        implementationAuthority = _implementationAuthority;
-    }
-    
-    /// @notice Creates a new identity for a user
-    /// @param owner The address that will own the identity
-    /// @return The address of the new identity contract
-    function createIdentity(address owner) external returns (address) {
-        // Create new identity using OnchainID implementation
-        Identity newIdentity = new Identity(
-            owner,
-            false // Not a master identity
-        );
-        
-        emit IdentityCreated(address(newIdentity), owner);
-        return address(newIdentity);
-    }
-}
-
-/// @title Registry for managing OnchainID identities
-/// @notice Tracks verified identities and their accreditation status
+/// @title Registry for managing OnchainID identities using Gateway deployment
 contract IdentityRegistry is Ownable {
     struct IdentityInfo {
         address identityContract;    // Address of the OnchainID contract
@@ -44,39 +18,73 @@ contract IdentityRegistry is Ownable {
         uint256[] claimTopics;      // List of required claim topics
     }
     
+    IGateway public immutable _gateway;
+    address public immutable _factory;
+    address public immutable _implementationAuthority;
+    
     mapping(address => IdentityInfo) public identities;
     mapping(address => bool) public trustedIssuers;
     mapping(uint256 => bool) public validClaimTopics;
-    
-    IdentityFactory public immutable factory;
     
     event IdentityRegistered(address indexed user, address indexed identityContract);
     event AccreditationUpdated(address indexed user, bool status);
     event IssuerTrustUpdated(address indexed issuer, bool trusted);
     event ClaimTopicUpdated(uint256 indexed topic, bool valid);
+    event DebugConstructor(address gateway, address factory, address authority);
     
-    constructor(address _factory) {
-        require(_factory != address(0), "Invalid factory address");
-        factory = IdentityFactory(_factory);
+    constructor(
+        address gatewayAddress,
+        address factoryAddress,
+        address authorityAddress
+    ) Ownable() {
+        require(gatewayAddress != address(0), "1: Invalid gateway address");
+        require(factoryAddress != address(0), "2: Invalid factory address");
+        require(authorityAddress != address(0), "3: Invalid implementation authority");
+        
+        _factory = factoryAddress;
+        _implementationAuthority = authorityAddress;
+        _gateway = IGateway(gatewayAddress);
+        
+        emit DebugConstructor(gatewayAddress, factoryAddress, authorityAddress);
     }
     
-    /// @notice Registers a new identity for a user
+    /// @notice Registers a new identity for a user using the Gateway
     /// @param user The address of the user
     /// @param claimTopics Array of required claim topics
-    function registerIdentity(address user, uint256[] calldata claimTopics) external onlyOwner {
+    function registerIdentity(address user, uint256[] calldata claimTopics) external {
         require(identities[user].identityContract == address(0), "Identity already registered");
         
-        // Create new identity through factory
-        address identityContract = factory.createIdentity(user);
+        // Compute the expected identity address before deployment
+        bytes32 salt = bytes32(uint256(uint160(user)));
+        address expectedIdentity = _computeExpectedAddress(user, salt);
+        
+        // Deploy identity through gateway
+        _gateway.deployIdentityForWallet(user);
         
         identities[user] = IdentityInfo({
-            identityContract: identityContract,
+            identityContract: expectedIdentity,
             isAccredited: false,
             lastVerified: 0,
             claimTopics: claimTopics
         });
         
-        emit IdentityRegistered(user, identityContract);
+        emit IdentityRegistered(user, expectedIdentity);
+    }
+    
+    /// @notice Computes the expected identity address using CREATE2
+    function _computeExpectedAddress(address owner, bytes32 salt) internal view returns (address) {
+        bytes32 hash = keccak256(
+            abi.encodePacked(
+                bytes1(0xff),
+                _factory,
+                salt,
+                keccak256(abi.encodePacked(
+                    type(Identity).creationCode,
+                    abi.encode(owner, false)
+                ))
+            )
+        );
+        return address(uint160(uint256(hash)));
     }
     
     /// @notice Verifies claims for an identity
